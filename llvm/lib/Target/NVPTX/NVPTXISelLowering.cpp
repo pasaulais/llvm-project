@@ -672,7 +672,7 @@ NVPTXTargetLowering::NVPTXTargetLowering(const NVPTXTargetMachine &TM,
 
   // We have some custom DAG combine patterns for these nodes
   setTargetDAGCombine({ISD::ADD, ISD::AND, ISD::FADD, ISD::MUL, ISD::SHL,
-                       ISD::SREM, ISD::UREM});
+                       ISD::SREM, ISD::UREM, ISD::LOAD});
 
   // setcc for f16x2 and bf16x2 needs special handling to prevent
   // legalizer's attempt to scalarize it due to v2i1 not being legal.
@@ -5252,6 +5252,53 @@ static SDValue PerformSETCCCombine(SDNode *N,
                          CCNode.getValue(1));
 }
 
+static SDValue PerformLOADCombine(SDNode *N,
+                                  TargetLowering::DAGCombinerInfo &DCI) {
+  // This transform only supports loads of 128-bit vector types that are not
+  // legal. It converts the load to a legal type instead of letting the backend
+  // split it into smaller loads during legalization. This is only done if the
+  // only users of this node are extract nodes.
+  EVT VT = N->getValueType(0);
+  if (VT != MVT::v16i8 && VT != MVT::v8i16) {
+    return SDValue();
+  }
+  EVT EleVT = VT.getVectorElementType();
+  for (SDNode::use_iterator I = N->use_begin(), E = N->use_end(); I != E; ++I) {
+    SDUse &U(I.getUse());
+    if (U.getValueType() != MVT::Other &&
+        U.getUser()->getOpcode() != ISD::EXTRACT_VECTOR_ELT) {
+      return SDValue();
+    }
+  }
+
+  SDValue Chain = N->getOperand(0);
+  SDValue Ptr = N->getOperand(1);
+  SDLoc DL(N);
+  EVT LegalVT = MVT::v4i32;
+  EVT LegalEleVT = LegalVT.getVectorElementType();
+  unsigned NumEleInLane = LegalEleVT.getSizeInBits() / EleVT.getSizeInBits();
+
+  // Create a new load with a legal type of the same size as the original type.
+  SDValue NewLoad = DCI.DAG.getLoad(LegalVT, DL, Chain, Ptr,
+                                    cast<LoadSDNode>(N)->getMemOperand());
+
+  // Create values for all elements of the original vector type and gather
+  // them in a vector.
+  SmallVector<SDValue, 16> Eles;
+  for (unsigned i = 0; i < VT.getVectorNumElements(); i++) {
+    SDValue LaneIdx = DCI.DAG.getConstant(i / NumEleInLane, DL, MVT::i32);
+    SDValue Lane = DCI.DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, LegalEleVT,
+                                   {NewLoad, LaneIdx});
+    unsigned ShiftAmount = (i % NumEleInLane) * EleVT.getScalarSizeInBits();
+    SDValue Shift = DCI.DAG.getConstant(ShiftAmount, DL, MVT::i32);
+    SDValue Ele = DCI.DAG.getNode(ISD::SRL, DL, LegalEleVT, {Lane, Shift});
+    Ele = DCI.DAG.getAnyExtOrTrunc(Ele, DL, EleVT);
+    Eles.push_back(Ele);
+  }
+  SDValue Vec = DCI.DAG.getBuildVector(VT, DL, Eles);
+  return DCI.DAG.getMergeValues({Vec, SDValue(NewLoad.getNode(), 1)}, DL);
+}
+
 SDValue NVPTXTargetLowering::PerformDAGCombine(SDNode *N,
                                                DAGCombinerInfo &DCI) const {
   CodeGenOptLevel OptLevel = getTargetMachine().getOptLevel();
@@ -5271,6 +5318,8 @@ SDValue NVPTXTargetLowering::PerformDAGCombine(SDNode *N,
       return PerformREMCombine(N, DCI, OptLevel);
     case ISD::SETCC:
       return PerformSETCCCombine(N, DCI);
+    case ISD::LOAD:
+      return PerformLOADCombine(N, DCI);
     case NVPTXISD::StoreRetval:
     case NVPTXISD::StoreRetvalV2:
     case NVPTXISD::StoreRetvalV4:
