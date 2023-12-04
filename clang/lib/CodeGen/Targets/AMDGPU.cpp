@@ -362,9 +362,13 @@ void AMDGPUTargetCodeGenInfo::setFunctionDeclAttributes(
 /// AMDGPU ROCm device libraries.
 void AMDGPUTargetCodeGenInfo::emitTargetGlobals(
     CodeGen::CodeGenModule &CGM) const {
-  StringRef Name = "llvm.amdgcn.abi.version";
+  StringRef Name = "__oclc_ABI_version";
   llvm::GlobalVariable *OriginalGV = CGM.getModule().getNamedGlobal(Name);
   if (OriginalGV && !llvm::GlobalVariable::isExternalLinkage(OriginalGV->getLinkage()))
+    return;
+
+  if (CGM.getTarget().getTargetOpts().CodeObjectVersion ==
+      llvm::CodeObjectVersionKind::COV_None)
     return;
 
   auto *Type = llvm::IntegerType::getIntNTy(CGM.getModule().getContext(), 32);
@@ -388,6 +392,26 @@ void AMDGPUTargetCodeGenInfo::emitTargetGlobals(
   }
 }
 
+// Add metadata to specific atomic instructions, to mark them as potentially
+// accessing fine-grained memory locations.
+static void addFineGrainedAtomicMD(llvm::Function *F) {
+  llvm::LLVMContext &Ctx = F->getContext();
+  llvm::MDBuilder MDHelper(Ctx);
+  auto *Int32Ty = llvm::IntegerType::getInt32Ty(Ctx);
+  for (llvm::BasicBlock &BB : *F) {
+    for (llvm::Instruction &I : BB) {
+      llvm::AtomicRMWInst *ARI = llvm::dyn_cast<llvm::AtomicRMWInst>(&I);
+      if (!ARI || ARI->getOperation() != llvm::AtomicRMWInst::Xor)
+        continue;
+      auto *Key = MDHelper.createString("fine_grained");
+      auto *One = MDHelper.createConstant(llvm::ConstantInt::get(Int32Ty, 1));
+      llvm::MDNode *MD = llvm::MDNode::get(Ctx, {Key, One});
+      auto *Tuple = llvm::MDNode::get(Ctx, {MD});
+      ARI->setMetadata("amdgpu.atomic", Tuple);
+    }
+  }
+}
+
 void AMDGPUTargetCodeGenInfo::setTargetAttributes(
     const Decl *D, llvm::GlobalValue *GV, CodeGen::CodeGenModule &M) const {
   if (requiresAMDGPUProtectedVisibility(D, GV)) {
@@ -408,6 +432,9 @@ void AMDGPUTargetCodeGenInfo::setTargetAttributes(
 
   if (M.getContext().getTargetInfo().allowAMDGPUUnsafeFPAtomics())
     F->addFnAttr("amdgpu-unsafe-fp-atomics", "true");
+
+  if (M.getContext().getTargetInfo().allowAMDGPUFineGrainedMem())
+    addFineGrainedAtomicMD(F);
 
   if (!getABIInfo().getCodeGenOpts().EmitIEEENaNCompliantInsts)
     F->addFnAttr("amdgpu-ieee", "false");
@@ -594,7 +621,8 @@ llvm::Value *AMDGPUTargetCodeGenInfo::createEnqueuedBlockKernel(
 
 void CodeGenModule::handleAMDGPUFlatWorkGroupSizeAttr(
     llvm::Function *F, const AMDGPUFlatWorkGroupSizeAttr *FlatWGS,
-    const ReqdWorkGroupSizeAttr *ReqdWGS) {
+    const ReqdWorkGroupSizeAttr *ReqdWGS, int32_t *MinThreadsVal,
+    int32_t *MaxThreadsVal) {
   unsigned Min = 0;
   unsigned Max = 0;
   if (FlatWGS) {
@@ -607,8 +635,13 @@ void CodeGenModule::handleAMDGPUFlatWorkGroupSizeAttr(
   if (Min != 0) {
     assert(Min <= Max && "Min must be less than or equal Max");
 
+    if (MinThreadsVal)
+      *MinThreadsVal = Min;
+    if (MaxThreadsVal)
+      *MaxThreadsVal = Max;
     std::string AttrVal = llvm::utostr(Min) + "," + llvm::utostr(Max);
-    F->addFnAttr("amdgpu-flat-work-group-size", AttrVal);
+    if (F)
+      F->addFnAttr("amdgpu-flat-work-group-size", AttrVal);
   } else
     assert(Max == 0 && "Max must be zero");
 }

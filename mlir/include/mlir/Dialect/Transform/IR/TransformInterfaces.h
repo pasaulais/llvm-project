@@ -95,11 +95,23 @@ public:
     return *this;
   }
 
+  // Ensures that only a single top-level transform op is present in the IR.
+  TransformOptions &enableEnforceSingleToplevelTransformOp(bool enable = true) {
+    enforceSingleToplevelTransformOp = enable;
+    return *this;
+  }
+
   /// Returns true if the expensive checks are requested.
   bool getExpensiveChecksEnabled() const { return expensiveChecksEnabled; }
 
+  // Returns true if enforcing a single top-level transform op is requested.
+  bool getEnforceSingleToplevelTransformOp() const {
+    return enforceSingleToplevelTransformOp;
+  }
+
 private:
   bool expensiveChecksEnabled = true;
+  bool enforceSingleToplevelTransformOp = true;
 };
 
 /// Entry point to the Transform dialect infrastructure. Applies the
@@ -777,18 +789,6 @@ private:
   /// Each region must be an ancestor of the following regions in this list.
   /// These are also the keys for "mappings".
   SmallVector<Region *> regionStack;
-
-  /// This cache stores operation names for operations that are tracked in the
-  /// transform dialect state. It is used to detect missing memory side effects
-  /// and op tracking.
-  ///
-  /// All tracked ops are added to this cache before a transform op is applied.
-  /// After the application of the transform op, the names of all tracked ops
-  /// are compared with the names in the cache. If there is a mismatch (or a
-  /// crash), op tracking is missing somewhere. This is typically a missing
-  /// "consumesHandle" side effect or a pattern that removes an op without
-  /// notifying a TrackingListener.
-  DenseMap<Operation *, OperationName> cachedNames;
 #endif // LLVM_ENABLE_ABI_BREAKING_CHECKS
 };
 
